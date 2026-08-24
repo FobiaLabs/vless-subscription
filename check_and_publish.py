@@ -25,8 +25,12 @@ REPO_DIR = Path(__file__).parent
 SOURCES = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt",
+    # 0xRadikal/Free-v2ray-Configs — общий список (vless/vmess/trojan/hy2), берём только vless://
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/all/configs.txt",
+    # kort0881/vpn-vless-configs-russia — vless с суффиксом "| 1ms" в конце строк
+    "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/output/vless.txt",
 ]
-MAX_WORKERS = 30
+MAX_WORKERS = 80
 TEST_TIMEOUT = 5
 MAX_LATENCY_MS = 2500
 
@@ -42,9 +46,18 @@ ALL_KEYWORDS = [kw for kws in COUNTRIES.values() for kw in kws]
 
 
 def fetch_keys(url):
-    resp = requests.get(url, timeout=15)
+    resp = requests.get(url, timeout=60)
     resp.raise_for_status()
-    return [l.strip() for l in resp.text.splitlines() if l.strip().startswith("vless://")]
+    keys = []
+    for line in resp.text.splitlines():
+        line = line.strip()
+        if not line.startswith("vless://"):
+            continue
+        # kort0881 пишет "vless://... | 1ms" — обрезаем хвост после первого " | "
+        if " | " in line.split("#", 1)[-1] or line.rstrip().rfind(" | ") > line.rfind("#"):
+            line = line[: line.rfind(" | ")].strip()
+        keys.append(line)
+    return list(dict.fromkeys(keys))
 
 
 def parse_host_port(key):
