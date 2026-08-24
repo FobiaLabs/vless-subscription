@@ -1,13 +1,5 @@
 {
-  "updated_at": "2026-08-24 21:56 UTC",
-  "total_working": 5441,
-  "groups": {
-    "baltics": 8,
-    "finland": 5,
-    "germany": 18,
-    "sweden": 3,
-    "netherlands": 12,
-    "poland": 5,
-    "other": 5390
-  }
+  "total": 21513,
+  "total_working": 64,
+  "updated_at": "2026-08-24 22:37 UTC"
 }
