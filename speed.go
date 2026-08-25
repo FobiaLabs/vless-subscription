@@ -94,7 +94,7 @@ func renameKey(key, name string) string {
 	if i := strings.Index(base, "#"); i >= 0 {
 		base = base[:i]
 	}
-	return base + "#" + url.QueryEscape(name)
+	return base + "#" + strings.ReplaceAll(url.QueryEscape(name), "+", "%20")
 }
 
 func hostOf(uri string) string {
