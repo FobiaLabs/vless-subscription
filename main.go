@@ -48,6 +48,7 @@ type result struct {
 	Port    int     `json:"port"`
 	Latency int     `json:"latency_ms"` // реальная, через туннель
 	TCPMs   float64 `json:"tcp_ms"`
+	Mbps    float64 `json:"mbps"` // скорость загрузки через туннель
 }
 
 var tailSuffix = regexp.MustCompile(`\s+\|\s+[^|]*$`)
@@ -242,10 +243,69 @@ func main() {
 	wg.Wait()
 	fmt.Printf("\nРеально рабочих: %d из %d (TCP-прошли) из %d (всего)\n", len(verified), len(passed), len(uniq))
 
-	sort.Slice(verified, func(i, j int) bool { return verified[i].Latency < verified[j].Latency })
+	fmt.Println("\n=== Этап 3.5: замер скорости ===")
+	var speedWorkers = verifyWorkers
+	var done2 atomic.Int64
+	sem2 := make(chan struct{}, speedWorkers)
+	var wg2 sync.WaitGroup
+	for i := range verified {
+		wg2.Add(1)
+		go func(idx int) {
+			defer wg2.Done()
+			sem2 <- struct{}{}
+			defer func() { <-sem2 }()
+			port := basePort + idx%speedWorkers
+			t, err := Start(verified[idx].Key, port, 5*time.Second)
+			if err != nil {
+				done2.Add(1)
+				return
+			}
+			verified[idx].Mbps = measureSpeed(verified[idx], port)
+			t.Stop()
+			d := done2.Add(1)
+			if verified[idx].Mbps > 0 {
+				fmt.Printf("[speed %d/%d] ✅ %s:%d — %.1f Mbps\n", d, len(verified), verified[idx].Host, verified[idx].Port, verified[idx].Mbps)
+			} else {
+				fmt.Printf("[speed %d/%d] ⚠ %s:%d — не измерена\n", d, len(verified), verified[idx].Host, verified[idx].Port)
+			}
+		}(i)
+	}
+	wg2.Wait()
+
+	// сортировка основной подписки: по скорости, без скорости — по латентности
+	sort.SliceStable(verified, func(i, j int) bool {
+		if (verified[i].Mbps > 0) != (verified[j].Mbps > 0) {
+			return verified[i].Mbps > 0
+		}
+		if verified[i].Mbps > 0 {
+			return verified[i].Mbps > verified[j].Mbps
+		}
+		return verified[i].Latency < verified[j].Latency
+	})
 
 	fmt.Println("\n=== Этап 4: публикация ===")
 	publish(verified, len(uniq))
+}
+
+// buildTop20 — топ быстрых конфигов с переименованными узлами.
+func buildTop20(verified []result) string {
+	var withSpeed []result
+	for _, r := range verified {
+		if r.Mbps > 0 {
+			withSpeed = append(withSpeed, r)
+		}
+	}
+	sort.SliceStable(withSpeed, func(i, j int) bool { return withSpeed[i].Mbps > withSpeed[j].Mbps })
+	const topN = 20
+	if len(withSpeed) > topN {
+		withSpeed = withSpeed[:topN]
+	}
+	var lines []string
+	lines = append(lines, "#profile-title: ⚡ VLESS Top-20 Speed", "#profile-update-interval: 12", "")
+	for i, r := range withSpeed {
+		lines = append(lines, renameKey(r.Key, fmt.Sprintf("%02d. %s", i+1, prettyName(r.Key, r.Mbps))))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func publish(verified []result, total int) {
@@ -267,6 +327,12 @@ func publish(verified []result, total int) {
 	}
 	b, _ := json.MarshalIndent(stats, "", "  ")
 	os.WriteFile("stats.json", b, 0644)
+
+	// топ-20 по скорости с красивыми именами — отдельная подписка
+	top := base64.StdEncoding.EncodeToString([]byte(buildTop20(verified)))
+	if err := os.WriteFile("top20_subscription.txt", []byte(top), 0644); err != nil {
+		fmt.Println("❌ top20_subscription.txt:", err)
+	}
 
 	run("git", "add", "-A")
 	if code := run("git", "diff", "--cached", "--quiet"); code == 0 {
