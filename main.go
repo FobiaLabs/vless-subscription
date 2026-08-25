@@ -301,9 +301,12 @@ func buildTop20(verified []result) string {
 		withSpeed = withSpeed[:topN]
 	}
 	var lines []string
-	lines = append(lines, "#profile-title: ⚡ VLESS Top-20 Speed", "#profile-update-interval: 12", "")
+	lines = append(lines,
+		"#profile-title: ⚡ Fobia VPN — Top-20 Speed",
+		"#profile-update-interval: 12",
+		"")
 	for i, r := range withSpeed {
-		lines = append(lines, renameKey(r.Key, fmt.Sprintf("%02d. %s", i+1, prettyName(r.Key, r.Mbps))))
+		lines = append(lines, renameKey(r.Key, fmt.Sprintf("%02d · %s", i+1, prettyName(r.Key, r.Mbps))))
 	}
 	return strings.Join(lines, "\n")
 }

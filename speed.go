@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -41,12 +42,16 @@ func measureSpeed(r result, port int) float64 {
 	return float64(n) * 8 / el / 1e6
 }
 
-// prettyName строит имя вида "🇩🇪 🚀 44Mb · Germany, Frankfurt".
+// prettyName строит имя вида "🇩🇪 Fobia · 🚀 44 Mb · Germany".
 // Пинг не включаем — Happ показывает свой.
 func prettyName(key string, mbps float64) string {
 	frag := ""
 	if i := strings.Index(key, "#"); i >= 0 {
 		frag = key[i+1:]
+	}
+	// фрагмент в ключах обычно процентно-закодирован — раскодируем
+	if dec, err := url.QueryUnescape(frag); err == nil {
+		frag = dec
 	}
 	flag := "🌐"
 	if m := emojiRe.FindString(frag); m != "" {
@@ -55,8 +60,12 @@ func prettyName(key string, mbps float64) string {
 	country := junkRe.ReplaceAllString(frag, "")
 	country = strings.ReplaceAll(country, "|", " ")
 	country = regexp.MustCompile(`\[BL\]|\[WL\]`).ReplaceAllString(country, "")
+	// убрать повторные флаги и мусорные токены
+	country = emojiRe.ReplaceAllString(country, "")
+	country = regexp.MustCompile(`(?i)\b(anycast-ip|anycast|unknown|free-nodes|vless-\d+)\b`).ReplaceAllString(country, "")
+	country = regexp.MustCompile(`[^\p{L}\p{N},\s\-]`).ReplaceAllString(country, " ")
 	country = regexp.MustCompile(`\s+`).ReplaceAllString(country, " ")
-	country = strings.Trim(country, " -·")
+	country = strings.Trim(country, " -·,")
 	// первая буква в верхний регистр без внешних зависимостей
 	if country != "" {
 		r := []rune(country)
@@ -65,8 +74,8 @@ func prettyName(key string, mbps float64) string {
 			country = string(r)
 		}
 	}
-	if country == "" {
-		country = hostOf(key)
+	if country == "" || len([]rune(country)) > 24 {
+		country = hostOnly(key)
 	}
 	icon := "✔"
 	switch {
@@ -79,13 +88,28 @@ func prettyName(key string, mbps float64) string {
 	case mbps > 0:
 		icon = "🐌"
 	}
-	name := fmt.Sprintf("%s %s %.0fMb · %s", flag, icon, mbps, country)
+	name := fmt.Sprintf("%s Fobia · %s %.0f Mb · %s", flag, icon, mbps, country)
 	const maxLen = 60
 	runeName := []rune(name)
 	if len(runeName) > maxLen {
-		name = string(runeName[:maxLen]) + "…"
+		name = string(runeName[:maxLen])
+		// не оставляем оборванные эмодзи/суррогаты на границе
+		for len(name) > 0 && (strings.HasSuffix(name, string(rune(0xFFFD))) || !utf8.ValidString(name)) {
+			r := []rune(name)
+			name = string(r[:len(r)-1])
+		}
+		name += "…"
 	}
 	return name
+}
+
+// hostOnly — хост без порта, для случаев когда имя страны слишком длинное.
+func hostOnly(uri string) string {
+	h := hostOf(uri)
+	if i := strings.LastIndex(h, ":"); i >= 0 && !strings.Contains(h[i+1:], ".") {
+		h = h[:i] // срезаем порт у ip:port
+	}
+	return h
 }
 
 // renameKey заменяет фрагмент-имя ключа.
