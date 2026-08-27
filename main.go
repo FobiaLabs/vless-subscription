@@ -150,8 +150,9 @@ func tcpFilter(keys []string) []result {
 }
 
 // realVerify поднимает sing-box тоннель и делает HTTP-запрос через него.
-func realVerify(r result, portOffset int) (result, bool) {
-	port := basePort + portOffset
+func realVerify(r result) (result, bool) {
+	port := <-portPool
+	defer func() { portPool <- port }()
 	t, err := Start(r.Key, port, 5*time.Second)
 	if err != nil {
 		return r, false
@@ -188,6 +189,19 @@ func mustURL(s string) *url.URL {
 	return u
 }
 
+// portPool — пул уникальных портов для одновременно живых туннелей.
+// Каждый активный туннель берёт порт из пула и возвращает его обратно,
+// чтобы исключить коллизии (раньше порт считался как idx%workers — разные
+// ключи одновременно получали один порт, и туннели мешали друг другу).
+var portPool chan int
+
+func initPortPool(n int) {
+	portPool = make(chan int, n)
+	for p := basePort; p < basePort+n; p++ {
+		portPool <- p
+	}
+}
+
 func main() {
 	fmt.Println("=== Этап 1: загрузка источников ===")
 	var all []string
@@ -212,6 +226,7 @@ func main() {
 		fmt.Println("❌", err)
 		os.Exit(1)
 	}
+	initPortPool(verifyWorkers)
 	var verified []result
 	var done atomic.Int64
 	sem := make(chan struct{}, verifyWorkers)
@@ -223,7 +238,7 @@ func main() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			vr, ok := realVerify(r, idx%verifyWorkers)
+			vr, ok := realVerify(r)
 			done.Add(1)
 			status := "✅"
 			if ok {
@@ -254,7 +269,8 @@ func main() {
 			defer wg2.Done()
 			sem2 <- struct{}{}
 			defer func() { <-sem2 }()
-			port := basePort + idx%speedWorkers
+			port := <-portPool
+			defer func() { portPool <- port }()
 			t, err := Start(verified[idx].Key, port, 5*time.Second)
 			if err != nil {
 				done2.Add(1)
@@ -287,7 +303,10 @@ func main() {
 	publish(verified, len(uniq))
 }
 
-// buildTop20 — топ быстрых конфигов с переименованными узлами.
+// buildTop20 — топ конфигов с переименованными узлами.
+// Сначала пытаемся взять по скорости (Mbps>0); если измерена хотя бы у части —
+// берём только их, отсортированных по скорости. Если скорость не измерилась ни у
+// кого (частый случай для слабых публичных узлов) — fallback на латентность.
 func buildTop20(verified []result) string {
 	var withSpeed []result
 	for _, r := range verified {
@@ -295,17 +314,29 @@ func buildTop20(verified []result) string {
 			withSpeed = append(withSpeed, r)
 		}
 	}
-	sort.SliceStable(withSpeed, func(i, j int) bool { return withSpeed[i].Mbps > withSpeed[j].Mbps })
 	const topN = 20
-	if len(withSpeed) > topN {
-		withSpeed = withSpeed[:topN]
+	var top []result
+	if len(withSpeed) > 0 {
+		sort.SliceStable(withSpeed, func(i, j int) bool { return withSpeed[i].Mbps > withSpeed[j].Mbps })
+		if len(withSpeed) > topN {
+			withSpeed = withSpeed[:topN]
+		}
+		top = withSpeed
+	} else {
+		// fallback: по латентности (самые быстрые по отклику)
+		cp := append([]result(nil), verified...)
+		sort.SliceStable(cp, func(i, j int) bool { return cp[i].Latency < cp[j].Latency })
+		if len(cp) > topN {
+			cp = cp[:topN]
+		}
+		top = cp
 	}
 	var lines []string
 	lines = append(lines,
 		"#profile-title: ⚡ Fobia VPN — Top-20 Speed",
 		"#profile-update-interval: 12",
 		"")
-	for i, r := range withSpeed {
+	for i, r := range top {
 		lines = append(lines, renameKey(r.Key, fmt.Sprintf("%02d · %s", i+1, prettyName(r.Key, r.Mbps))))
 	}
 	return strings.Join(lines, "\n")
