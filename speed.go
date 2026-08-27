@@ -21,6 +21,22 @@ const (
 var emojiRe = regexp.MustCompile(`[\x{1F1E6}-\x{1F1FF}]{2}`)
 var junkRe = regexp.MustCompile(`[\x{1F300}-\x{1FAFF}\x{2B00}-\x{2BFF}✅⭐🔥❄️⚡]`)
 
+// китайские названия стран в именах узлов → флаги и английские названия
+var cnFlags = map[string]string{
+	"英国": "🇬🇧 UK", "美国": "🇺🇸 USA", "俄罗斯": "🇷🇺 Russia", "俄罗斯联邦": "🇷🇺 Russia",
+	"瑞士": "🇨🇭 Switzerland", "德国": "🇩🇪 Germany", "法国": "🇫🇷 France", "荷兰": "🇳🇱 Netherlands",
+	"日本": "🇯🇵 Japan", "韩国": "🇰🇷 Korea", "新加坡": "🇸🇬 Singapore", "中国": "🇨🇳 China",
+	"意大利": "🇮🇹 Italy", "西班牙": "🇪🇸 Spain", "土耳其": "🇹🇷 Turkey", "印度": "🇮🇳 India",
+	"加拿大": "🇨🇦 Canada", "澳大利亚": "🇦🇺 Australia", "芬兰": "🇫🇮 Finland", "瑞典": "🇸🇪 Sweden",
+	"挪威": "🇳🇴 Norway", "丹麦": "🇩🇰 Denmark", "波兰": "🇵🇱 Poland", "乌克兰": "🇺🇦 Ukraine",
+	"哈萨克斯坦": "🇰🇿 Kazakhstan", "格鲁吉亚": "🇬🇪 Georgia", "阿联酋": "🇦🇪 UAE", "以色列": "🇮🇱 Israel",
+	"巴西": "🇧🇷 Brazil", "墨西哥": "🇲🇽 Mexico", "香港": "🇭🇰 Hong Kong", "台湾": "🇹🇼 Taiwan",
+	"未知": "",
+}
+
+// вычистить имена генераторов и прочий мусор
+var junkNameRe = regexp.MustCompile(`(?i)(by\s+ebrasha|ebrasha|free[-_\s]?nodes|@[\w.-]+|speedtest)`)
+
 // measureSpeed качает dlTestBytes через туннель, возвращает Mbps (0 — не удалось).
 func measureSpeed(r result, port int) float64 {
 	pu := mustURL(fmt.Sprintf("socks5://127.0.0.1:%d", port))
@@ -63,9 +79,26 @@ func prettyName(key string, mbps float64) string {
 	// убрать повторные флаги и мусорные токены
 	country = emojiRe.ReplaceAllString(country, "")
 	country = regexp.MustCompile(`(?i)\b(anycast-ip|anycast|unknown|free-nodes|vless-\d+)\b`).ReplaceAllString(country, "")
+	// имена генераторов: "By EbraSha ⌨️", "@tg", "speedtest" и т.п.
+	country = junkNameRe.ReplaceAllString(country, "")
+	// числовые суффиксы вида "082714102" (таймштампы китайских генераторов)
+	country = regexp.MustCompile(`[\s,_]*\d{4,}\s*$`).ReplaceAllString(country, "")
 	country = regexp.MustCompile(`[^\p{L}\p{N},\s\-]`).ReplaceAllString(country, " ")
 	country = regexp.MustCompile(`\s+`).ReplaceAllString(country, " ")
 	country = strings.Trim(country, " -·,")
+	// китайское название → флаг и английское название
+	for cn, repl := range cnFlags {
+		if strings.Contains(country, cn) {
+			if repl == "" {
+				country = ""
+			} else {
+				parts := strings.Fields(repl)
+				flag = parts[0]
+				country = strings.Join(parts[1:], " ")
+			}
+			break
+		}
+	}
 	// первая буква в верхний регистр без внешних зависимостей
 	if country != "" {
 		r := []rune(country)
@@ -88,7 +121,11 @@ func prettyName(key string, mbps float64) string {
 	case mbps > 0:
 		icon = "🐌"
 	}
-	name := fmt.Sprintf("%s Fobia · %s %.0f Mb · %s", flag, icon, mbps, country)
+	name := fmt.Sprintf("%s Fobia · %s", flag, icon)
+	if s := speedFmt(mbps); s != "" {
+		name += " " + s
+	}
+	name += " · " + country
 	const maxLen = 60
 	runeName := []rune(name)
 	if len(runeName) > maxLen {
@@ -101,6 +138,18 @@ func prettyName(key string, mbps float64) string {
 		name += "…"
 	}
 	return name
+}
+
+// speedFmt — "51 Mb" если скорость измерена, иначе "" (без "0 Mb" в имени).
+// Медленные (<1 Mbps) показываем с десятой, чтобы не было "0 Mb".
+func speedFmt(mbps float64) string {
+	if mbps > 0 {
+		if mbps < 10 {
+			return fmt.Sprintf("%.1f Mb", mbps)
+		}
+		return fmt.Sprintf("%.0f Mb", mbps)
+	}
+	return ""
 }
 
 // hostOnly — хост без порта, для случаев когда имя страны слишком длинное.

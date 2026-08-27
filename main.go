@@ -305,23 +305,37 @@ func main() {
 
 // buildTop20 — топ конфигов с переименованными узлами.
 // Сначала пытаемся взять по скорости (Mbps>0); если измерена хотя бы у части —
-// берём только их, отсортированных по скорости. Если скорость не измерилась ни у
+// берём их, отсортированных по скорости. Если скорость не измерилась ни у
 // кого (частый случай для слабых публичных узлов) — fallback на латентность.
 func buildTop20(verified []result) string {
+	const topN = 20
+	var top []result
 	var withSpeed []result
 	for _, r := range verified {
 		if r.Mbps > 0 {
 			withSpeed = append(withSpeed, r)
 		}
 	}
-	const topN = 20
-	var top []result
 	if len(withSpeed) > 0 {
 		sort.SliceStable(withSpeed, func(i, j int) bool { return withSpeed[i].Mbps > withSpeed[j].Mbps })
-		if len(withSpeed) > topN {
-			withSpeed = withSpeed[:topN]
+		if len(withSpeed) >= topN {
+			top = withSpeed[:topN]
+		} else {
+			// скоростных меньше 20 — добираем по латентности
+			top = withSpeed
+			rest := make([]result, 0, len(verified)-len(withSpeed))
+			for _, r := range verified {
+				if r.Mbps == 0 {
+					rest = append(rest, r)
+				}
+			}
+			sort.SliceStable(rest, func(i, j int) bool { return rest[i].Latency < rest[j].Latency })
+			need := topN - len(withSpeed)
+			if len(rest) > need {
+				rest = rest[:need]
+			}
+			top = append(top, rest...)
 		}
-		top = withSpeed
 	} else {
 		// fallback: по латентности (самые быстрые по отклику)
 		cp := append([]result(nil), verified...)
@@ -345,14 +359,19 @@ func buildTop20(verified []result) string {
 func publish(verified []result, total int) {
 	keys := make([]string, len(verified))
 	for i, r := range verified {
-		keys[i] = r.Key
+		keys[i] = renameKey(r.Key, prettyName(r.Key, r.Mbps))
 	}
 	sub := base64.StdEncoding.EncodeToString([]byte(strings.Join(keys, "\n")))
 	if err := os.WriteFile("subscription.txt", []byte(sub), 0644); err != nil {
 		fmt.Println("❌ subscription.txt:", err)
 		return
 	}
-	os.WriteFile("working_keys.txt", []byte(strings.Join(keys, "\n")+"\n"), 0644)
+	// рабочие ключи сырьём (без переименования) — для отладки и повторного замера
+	raw := make([]string, len(verified))
+	for i, r := range verified {
+		raw[i] = r.Key
+	}
+	os.WriteFile("working_keys.txt", []byte(strings.Join(raw, "\n")+"\n"), 0644)
 
 	stats := map[string]any{
 		"updated_at":    time.Now().UTC().Format("2006-01-02 15:04 UTC"),
