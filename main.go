@@ -174,7 +174,10 @@ func tcpFilter(keys []string) []result {
 	return out
 }
 
-// realVerify поднимает sing-box тоннель и делает HTTP-запрос через него.
+// realVerify поднимает sing-box тоннель и делает в нём сразу обе проверки:
+// HTTP-верификацию (Latency) и замер скорости (Mbps). Один туннель на оба теста
+// вместо двух отдельных этапов — экономия ~5с на старт второго sing-box и
+// снижение пикового потребления портов/процессов вдвое.
 func realVerify(r result) (result, bool) {
 	port := <-portPool
 	defer func() { portPool <- port }()
@@ -203,6 +206,8 @@ func realVerify(r result) (result, bool) {
 		return r, false
 	}
 	r.Latency = int(time.Since(start).Milliseconds())
+	// замер скорости через тот же туннель — не плодим второй sing-box
+	r.Mbps = measureSpeed(r, port)
 	return r, true
 }
 
@@ -303,42 +308,15 @@ func main() {
 			fmt.Printf("[%d/%d] %s %s:%d", done.Load(), len(passed), status, vr.Host, vr.Port)
 			if ok {
 				fmt.Printf(" — %d мс", vr.Latency)
+				if vr.Mbps > 0 {
+					fmt.Printf(" · %.1f Mbps", vr.Mbps)
+				}
 			}
 			fmt.Println()
 		}(r, i)
 	}
 	wg.Wait()
 	fmt.Printf("\nРеально рабочих: %d из %d (TCP-прошли) из %d (всего)\n", len(verified), len(passed), len(uniq))
-
-	fmt.Println("\n=== Этап 3.5: замер скорости ===")
-	var speedWorkers = verifyWorkers
-	var done2 atomic.Int64
-	sem2 := make(chan struct{}, speedWorkers)
-	var wg2 sync.WaitGroup
-	for i := range verified {
-		wg2.Add(1)
-		go func(idx int) {
-			defer wg2.Done()
-			sem2 <- struct{}{}
-			defer func() { <-sem2 }()
-			port := <-portPool
-			defer func() { portPool <- port }()
-			t, err := Start(verified[idx].Key, port, 5*time.Second)
-			if err != nil {
-				done2.Add(1)
-				return
-			}
-			verified[idx].Mbps = measureSpeed(verified[idx], port)
-			t.Stop()
-			d := done2.Add(1)
-			if verified[idx].Mbps > 0 {
-				fmt.Printf("[speed %d/%d] ✅ %s:%d — %.1f Mbps\n", d, len(verified), verified[idx].Host, verified[idx].Port, verified[idx].Mbps)
-			} else {
-				fmt.Printf("[speed %d/%d] ⚠ %s:%d — не измерена\n", d, len(verified), verified[idx].Host, verified[idx].Port)
-			}
-		}(i)
-	}
-	wg2.Wait()
 
 	// сортировка основной подписки: по скорости, без скорости — по латентности
 	sort.SliceStable(verified, func(i, j int) bool {
