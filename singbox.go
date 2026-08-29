@@ -117,7 +117,7 @@ func Start(uri string, port int, timeout time.Duration) (*Tunnel, error) {
 			conn.Close()
 			return t, nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond) // было 50мс — ловим старт ~на 25мс раньше
 	}
 	t.Stop()
 	if msg := tail(stderr.String(), 300); msg != "" {

@@ -27,12 +27,14 @@ import (
 
 const (
 	tcpWorkers    = 200 // TCP-фильтр лёгкий, можно агрессивно
-	verifyWorkers = 12  // sing-box процессы тяжелее
+	verifyWorkers = 24  // sing-box процессы: ×2 после Tier 1 (было 12)
 	tcpTimeout    = 5 * time.Second
 	verifyTimeout = 10 * time.Second
 	maxTCPFailMs  = 2500 // отсечка латентности на этапе TCP
 	basePort      = 21000
-	testURL       = "https://www.gstatic.com/generate_204"
+	// HTTP вместо HTTPS: без TLS-хендшейка, ~10мс вместо ~200мс на запрос.
+	// Главное — факт прохождения трафика через туннель, не шифрование.
+	testURL = "http://cp.cloudflare.com/"
 )
 
 var sources = []string{
@@ -115,6 +117,25 @@ func uriHostPort(uri string) (string, int) {
 	return s[:i], port
 }
 
+// dnsCache — кэш DNS-резолва: один раз резолвим хост, дальше переиспользуем IP.
+// Среди 21k ключей множество шарят хост (разные UUID/path/порт) — экономим
+// повторные getaddrinfo.
+var dnsCache sync.Map // host → string (первый IP)
+
+func resolveFirst(host string) string {
+	if v, ok := dnsCache.Load(host); ok {
+		s, _ := v.(string)
+		return s
+	}
+	addrs, err := net.LookupHost(host)
+	if err != nil || len(addrs) == 0 {
+		return ""
+	}
+	ip := addrs[0]
+	dnsCache.Store(host, ip)
+	return ip
+}
+
 func tcpFilter(keys []string) []result {
 	sem := make(chan struct{}, tcpWorkers)
 	var mu sync.Mutex
@@ -130,8 +151,12 @@ func tcpFilter(keys []string) []result {
 			if host == "" || port == 0 {
 				return
 			}
+			ip := resolveFirst(host)
+			if ip == "" {
+				return
+			}
 			start := time.Now()
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprint(port)), tcpTimeout)
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprint(port)), tcpTimeout)
 			ms := time.Since(start).Seconds() * 1000
 			if err != nil {
 				return
@@ -203,23 +228,50 @@ func initPortPool(n int) {
 }
 
 func main() {
-	fmt.Println("=== Этап 1: загрузка источников ===")
+	fmt.Println("=== Этап 1: загрузка источников (параллельно) ===")
 	var all []string
+	var srcMu sync.Mutex
+	var srcWg sync.WaitGroup
 	for _, src := range sources {
-		keys, err := fetchKeys(src)
-		if err != nil {
-			fmt.Printf("⚠ %s: %v\n", shortSrc(src), err)
-			continue
-		}
-		fmt.Printf("%s: %d ключей\n", shortSrc(src), len(keys))
-		all = append(all, keys...)
+		srcWg.Add(1)
+		go func(s string) {
+			defer srcWg.Done()
+			keys, err := fetchKeys(s)
+			srcMu.Lock()
+			defer srcMu.Unlock()
+			if err != nil {
+				fmt.Printf("⚠ %s: %v\n", shortSrc(s), err)
+				return
+			}
+			fmt.Printf("%s: %d ключей\n", shortSrc(s), len(keys))
+			all = append(all, keys...)
+		}(src)
 	}
+	srcWg.Wait()
 	uniq := dedupe(all)
 	fmt.Printf("Итого уникальных: %d\n\n", len(uniq))
 
-	fmt.Println("=== Этап 2: TCP-фильтр ===")
-	passed := tcpFilter(uniq)
-	fmt.Printf("Прошли TCP: %d из %d\n\n", len(passed), len(uniq))
+	fmt.Println("=== Этап 2: TCP-фильтр (с дедупом по host:port) ===")
+	// Один TCP-тест на уникальный адрес: ключи с одним хостом/портом
+	// (разные UUID/path) делят результат. Экономия ~50-80% TCP-тестов.
+	addrToKey := make(map[string]string)
+	for _, k := range uniq {
+		h, p := uriHostPort(k)
+		if h == "" || p == 0 {
+			continue
+		}
+		a := fmt.Sprintf("%s:%d", h, p)
+		if _, ok := addrToKey[a]; !ok {
+			addrToKey[a] = k
+		}
+	}
+	toTest := make([]string, 0, len(addrToKey))
+	for _, k := range addrToKey {
+		toTest = append(toTest, k)
+	}
+	fmt.Printf("Уникальных адресов: %d (было ключей: %d)\n", len(toTest), len(uniq))
+	passed := tcpFilter(toTest)
+	fmt.Printf("Прошли TCP: %d из %d\n\n", len(passed), len(toTest))
 
 	fmt.Println("=== Этап 3: реальная проверка (sing-box) ===")
 	if _, err := EnsureBinary(); err != nil {
@@ -305,37 +357,23 @@ func main() {
 
 // buildTop20 — топ конфигов с переименованными узлами.
 // Сначала пытаемся взять по скорости (Mbps>0); если измерена хотя бы у части —
-// берём их, отсортированных по скорости. Если скорость не измерилась ни у
+// берём только их, отсортированных по скорости. Если скорость не измерилась ни у
 // кого (частый случай для слабых публичных узлов) — fallback на латентность.
 func buildTop20(verified []result) string {
-	const topN = 20
-	var top []result
 	var withSpeed []result
 	for _, r := range verified {
 		if r.Mbps > 0 {
 			withSpeed = append(withSpeed, r)
 		}
 	}
+	const topN = 20
+	var top []result
 	if len(withSpeed) > 0 {
 		sort.SliceStable(withSpeed, func(i, j int) bool { return withSpeed[i].Mbps > withSpeed[j].Mbps })
-		if len(withSpeed) >= topN {
-			top = withSpeed[:topN]
-		} else {
-			// скоростных меньше 20 — добираем по латентности
-			top = withSpeed
-			rest := make([]result, 0, len(verified)-len(withSpeed))
-			for _, r := range verified {
-				if r.Mbps == 0 {
-					rest = append(rest, r)
-				}
-			}
-			sort.SliceStable(rest, func(i, j int) bool { return rest[i].Latency < rest[j].Latency })
-			need := topN - len(withSpeed)
-			if len(rest) > need {
-				rest = rest[:need]
-			}
-			top = append(top, rest...)
+		if len(withSpeed) > topN {
+			withSpeed = withSpeed[:topN]
 		}
+		top = withSpeed
 	} else {
 		// fallback: по латентности (самые быстрые по отклику)
 		cp := append([]result(nil), verified...)
@@ -359,19 +397,14 @@ func buildTop20(verified []result) string {
 func publish(verified []result, total int) {
 	keys := make([]string, len(verified))
 	for i, r := range verified {
-		keys[i] = renameKey(r.Key, prettyName(r.Key, r.Mbps))
+		keys[i] = r.Key
 	}
 	sub := base64.StdEncoding.EncodeToString([]byte(strings.Join(keys, "\n")))
 	if err := os.WriteFile("subscription.txt", []byte(sub), 0644); err != nil {
 		fmt.Println("❌ subscription.txt:", err)
 		return
 	}
-	// рабочие ключи сырьём (без переименования) — для отладки и повторного замера
-	raw := make([]string, len(verified))
-	for i, r := range verified {
-		raw[i] = r.Key
-	}
-	os.WriteFile("working_keys.txt", []byte(strings.Join(raw, "\n")+"\n"), 0644)
+	os.WriteFile("working_keys.txt", []byte(strings.Join(keys, "\n")+"\n"), 0644)
 
 	stats := map[string]any{
 		"updated_at":    time.Now().UTC().Format("2006-01-02 15:04 UTC"),

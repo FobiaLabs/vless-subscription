@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	dlTestBytes = 2 << 20 // 2 MB на конфиг
-	dlTimeout   = 20 * time.Second
+	dlTestBytes = 1 << 20 // 1 MB на конфиг (было 2 MB)
+	dlTimeout   = 10 * time.Second
 	speedURL    = "https://speed.cloudflare.com/__down?bytes="
 )
 
